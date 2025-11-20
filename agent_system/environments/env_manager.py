@@ -23,6 +23,8 @@ from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
+from transformers import AutoTokenizer
+
 
 def parse_gamefile(infos):
     gamefile = []
@@ -128,7 +130,152 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 data_source = info.get("data_source")
                 success[f"{data_source}_success_rate"].append(won_value)
                 return  # Exit after finding the first active mask
-            
+
+class TALESEnvironmentManager(EnvironmentManagerBase):
+    # Added config because it is annoying to have to go into the code to switch values.
+    def __init__(self, envs, projection_f, env_name, istrain = True, config=None):
+        self.buffers = None
+        self.istrain = istrain
+        self.print_counter = False
+        self.ttp_switch = False
+        self.config = config
+        self.env_name = env_name
+        self.tok = AutoTokenizer.from_pretrained(self.config['actor_rollout_ref']['model']['path'], use_fast=True)
+        super().__init__(envs, projection_f, config)
+    
+    # Stripped down general manager to handle all of the frameworks from TALES
+    def reset(self, kwargs):
+        obs, infos = self.envs.reset()
+
+        if self.buffers is not None:
+            self.buffers.clear()
+
+        self.buffers = [[] for _ in range(len(obs))]
+        self.tasks = []
+        self.pre_text_obs = obs
+
+        full_text_obs = self.build_text_obs(obs, infos, init=True)
+        self.print_counter = True
+        return {'text': full_text_obs, 'image': None, 'anchor': obs.copy()}, infos
+    
+    def step(self, text_actions: List[str], refined_responses: List[str] = None):
+        actions, valids, thinking = self.projection_f(self.config['env']['prompt_template'], text_actions)
+        next_obs, rewards, dones, infos = self.envs.step(actions)
+  
+        # Get rid of negative rewards if using the zero-centered reward mode or goal only
+        if 'go' in self.config['env']['reward_mode']:
+            # Only reward for if the environment is won:
+            old_rewards = rewards
+            rewards = []
+            for i, info in enumerate(infos):
+                if info['won']:
+                    rewards.append(10)
+                elif info['lost']:
+                    rewards.append(-5)
+                else:
+                    rewards.append(0)
+        elif 'native' in self.config['env']['reward_mode']:
+            rewards = rewards
+        else:
+            raise ValueError(f"Unknown reward mode: {self.config['env']['reward_mode']}")
+
+        for i, info in enumerate(infos):
+            if info['won']:
+                print(f"Episode finished with reward {info['won']}, {rewards[i]}.")
+            if rewards[i] > 0:
+                print(f"Positive reward {rewards[i]} received, {info['won']}.")
+
+        
+
+        self.save_to_history_buffer(self.pre_text_obs, actions, thinking)
+        self.pre_text_obs = next_obs
+
+        # add action_valid to infos
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+
+        next_observations = {'text': self.build_text_obs(next_obs, infos), 
+                             'image': None, 
+                             'anchor': next_obs.copy()}
+        
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+ 
+
+        return next_observations, rewards, dones, infos
+        
+
+    def build_text_obs(self, text_obs: List[str], infos: List[dict], init: bool = False, history_length: int = 100) -> List[str]:
+        """
+        This function builds the text observation for the agent.
+        """
+        postprocess_text_obs = []
+        for i in range(len(text_obs)):
+            # Get last `history_length` steps
+            recent_history = self.buffers[i][-history_length:]
+            valid_history_length = len(recent_history)
+            start_index = len(self.buffers[i]) - valid_history_length
+            action_history = ""
+            action_history_with_think_arr = []
+            for j, record in enumerate(recent_history):
+                step_number = start_index + j + 1
+                action = record["action"]
+                env_obs = record["text_obs"]
+                if "thinking_trace" in record.keys():
+                    thinking_trace = record["thinking_trace"]
+                else:
+                    thinking_trace = "None or invalid thinking trace."
+                action_history += f"\n[Observation {step_number}: '{env_obs}', Action {step_number}: '{action}']"
+                action_history_with_think_arr.append(f"\n[Observation {step_number}: '{env_obs}', Thoughts {step_number}: '{thinking_trace}' Action {step_number}: '{action}']")
+            action_history_with_think = "".join(action_history_with_think_arr)
+
+            reformatted_admissible_actions = ""
+
+            if self.config['env']['prompt_template'] == "basecase":
+                GENERAL_TEMPLATE = general_INST_FIRST
+            elif self.config['env']['prompt_template'] == "admissible":
+                GENERAL_TEMPLATE = general_INST_FIRST_WITH_AA
+                reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in infos[i]['admissible_commands'] if s != 'help')
+            else:
+                raise ValueError(f"Unknown prompt template: {self.config.env.prompt_template}")
+
+            obs = GENERAL_TEMPLATE.format(
+                task_description=[],
+                step_count=len(self.buffers[i]),
+                history_length=valid_history_length,
+                action_history=action_history.strip(),
+                action_history_with_think=action_history_with_think.strip(),
+                current_step=len(self.buffers[i]) + 1,
+                current_observation=text_obs[i],
+                admissible_actions=reformatted_admissible_actions
+            )
+            postprocess_text_obs.append(obs)
+            # if i == 0 or i == 3:
+            #     print("\n=================================\n")
+            #     print("Obs:", obs)
+            #     print("\n=================================\n")
+
+
+        return postprocess_text_obs
+
+    def save_to_history_buffer(self, text_obs, actions, thinking_trace):
+        for i in range(len(actions)):
+            self.buffers[i].append({'text_obs': text_obs[i], 'action': actions[i], 'thinking_trace': thinking_trace[i]})
+
+    def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
+        # Find the last entry with active masks
+        for i in reversed(range(len(total_batch_list[batch_idx]))):
+            batch_item = total_batch_list[batch_idx][i]
+            if batch_item['active_masks']:
+                info = total_infos[batch_idx][i]
+                won_value = float(info['won'])
+                success['success_rate'].append(won_value)
+                
+                # Process game file if it exists
+                gamefile = info.get("extra.gamefile")
+                if gamefile:
+                    self._process_gamefile(gamefile, won_value, success)
+                return  # Exit after finding the first active mask           
 
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
@@ -609,7 +756,22 @@ def make_envs(config):
     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
     resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
 
-    if "search" in config.env.env_name.lower():
+    if "tales_" in config.env.env_name.lower():
+        from agent_system.environments.env_package.tales import build_tales_envs, tales_projection
+        # Get the specific environment:
+        target_env = config.env.env_name.split("tales_")[-1]
+        yaml_filepath = os.path.join(os.path.dirname(__file__), 'env_package/tales/configs', f'config.yaml')
+        _envs = build_tales_envs(yaml_filepath, seed=config.env.seed, env_num=config.data.train_batch_size, 
+                                       group_n=group_n, main_config=config, is_train=True)
+        print("Training environments built successfully.")
+        _val_envs = build_tales_envs(yaml_filepath, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, 
+                                           group_n=1, main_config=config, is_train=False)
+        projection_f = partial(tales_projection)
+        envs = TALESEnvironmentManager(_envs, projection_f, env_name=target_env, config=config)
+        val_envs = TALESEnvironmentManager(_val_envs, projection_f, env_name=target_env, istrain=False, config=config)
+
+        return envs, val_envs
+    elif "search" in config.env.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
         _envs = build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env)
         _val_envs = build_search_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_config=config.env)

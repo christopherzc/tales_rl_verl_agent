@@ -1,0 +1,3 @@
+import tales
+
+print("Hi")
